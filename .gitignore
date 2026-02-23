@@ -1,0 +1,4 @@
+*.pptx
+*.ppt
+
+__pycache__

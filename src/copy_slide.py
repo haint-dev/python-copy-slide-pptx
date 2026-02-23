@@ -169,6 +169,199 @@ def _remove_placeholder_ref(sp_elem):
         nvPr.remove(ph)
 
 
+def _find_layout_placeholder(src_slide, ph_type, ph_idx):
+    """Find matching placeholder element in source layout or master."""
+    src_layout = src_slide.slide_layout
+    # Search layout first
+    layout_spTree = src_layout.element.find('.//' + qn('p:cSld')).find(qn('p:spTree'))
+    for sp in layout_spTree.findall(qn('p:sp')):
+        ph = _get_placeholder_info(sp)
+        if ph and ph[0] == ph_type and ph[1] == ph_idx:
+            return sp
+    # Fallback to master
+    master_spTree = src_layout.slide_master.element.find('.//' + qn('p:cSld')).find(qn('p:spTree'))
+    for sp in master_spTree.findall(qn('p:sp')):
+        ph = _get_placeholder_info(sp)
+        if ph and ph[0] == ph_type and ph[1] == ph_idx:
+            return sp
+    return None
+
+
+def _collect_defRPr_from_layout(layout_sp):
+    """
+    Collect default run properties (fill, font size) from a layout placeholder.
+    Searches lstStyle levels and direct paragraph defRPr.
+    Returns (default_fill_elem_or_None, default_sz_str_or_None).
+    """
+    if layout_sp is None:
+        return None, None
+
+    layout_txBody = layout_sp.find(qn('p:txBody'))
+    if layout_txBody is None:
+        return None, None
+
+    default_fill = None
+    default_sz = None
+
+    # Check lstStyle levels
+    lstStyle = layout_txBody.find(qn('a:lstStyle'))
+    if lstStyle is not None:
+        for lvl_tag in ['a:lvl1pPr', 'a:lvl2pPr', 'a:lvl3pPr']:
+            lvl = lstStyle.find(qn(lvl_tag))
+            if lvl is not None:
+                defRPr = lvl.find(qn('a:defRPr'))
+                if defRPr is not None:
+                    if default_fill is None:
+                        fill = defRPr.find(qn('a:solidFill'))
+                        if fill is not None:
+                            default_fill = deepcopy(fill)
+                    if default_sz is None:
+                        sz = defRPr.get('sz')
+                        if sz:
+                            default_sz = sz
+                if default_fill is not None and default_sz:
+                    break
+
+    # Also check direct defRPr in layout paragraphs
+    for p in layout_txBody.findall(qn('a:p')):
+        pPr = p.find(qn('a:pPr'))
+        if pPr is not None:
+            defRPr = pPr.find(qn('a:defRPr'))
+            if defRPr is not None:
+                if default_fill is None:
+                    fill = defRPr.find(qn('a:solidFill'))
+                    if fill is not None:
+                        default_fill = deepcopy(fill)
+                if default_sz is None:
+                    sz = defRPr.get('sz')
+                    if sz:
+                        default_sz = sz
+        if default_fill is not None and default_sz:
+            break
+
+    return default_fill, default_sz
+
+
+def _bake_placeholder_styles(sp_elem, src_slide):
+    """
+    Bake inherited properties from source layout into the shape before
+    converting it to a regular shape. Placeholders inherit position, size,
+    and text styles from their layout/master. Regular shapes don't inherit,
+    so we must resolve and inline these properties.
+
+    Bakes: position/size (xfrm), text color (solidFill), font size (sz).
+    For Keynote compatibility, ensures EVERY text run has explicit color
+    and font size, falling back to schemeClr tx1 / 1800 (18pt) if no
+    layout default is found.
+    """
+    ph_info = _get_placeholder_info(sp_elem)
+    if ph_info is None:
+        return
+
+    ph_type, ph_idx = ph_info
+    layout_sp = _find_layout_placeholder(src_slide, ph_type, ph_idx)
+
+    # --- Bake position/size ---
+    spPr = sp_elem.find(qn('p:spPr'))
+    if spPr is None:
+        spPr = etree.SubElement(sp_elem, qn('p:spPr'))
+
+    if spPr.find(qn('a:xfrm')) is None and layout_sp is not None:
+        layout_spPr = layout_sp.find(qn('p:spPr'))
+        if layout_spPr is not None:
+            xfrm = layout_spPr.find(qn('a:xfrm'))
+            if xfrm is not None:
+                spPr.insert(0, deepcopy(xfrm))
+
+    # --- Bake default text styles (color, font size) from layout into runs ---
+    default_fill, default_sz = _collect_defRPr_from_layout(layout_sp)
+
+    # Fallback: if no explicit fill found from layout, use schemeClr tx1
+    # (standard dark text color). This is critical for Keynote which
+    # cannot resolve inherited text color for non-placeholder shapes.
+    if default_fill is None:
+        default_fill = etree.Element(qn('a:solidFill'))
+        etree.SubElement(default_fill, qn('a:schemeClr'), {'val': 'tx1'})
+
+    # Fallback font size: 1800 (18pt) is a common default
+    if default_sz is None:
+        default_sz = '1800'
+
+    # Apply defaults to ALL runs that lack explicit values
+    txBody = sp_elem.find(qn('p:txBody'))
+    if txBody is None:
+        return
+
+    for r in txBody.iter(qn('a:r')):
+        rPr = r.find(qn('a:rPr'))
+        if rPr is None:
+            rPr = r.makeelement(qn('a:rPr'), {})
+            r.insert(0, rPr)
+        if rPr.find(qn('a:solidFill')) is None and rPr.find(qn('a:noFill')) is None:
+            rPr.append(deepcopy(default_fill))
+        if not rPr.get('sz'):
+            rPr.set('sz', default_sz)
+
+
+def _add_empty_placeholders_from_layout(dst_slide, dst_layout):
+    """
+    Add empty placeholder shapes to the slide for each placeholder in the layout.
+    This overrides the layout's placeholder text (which would otherwise show through)
+    while keeping non-placeholder shapes (decorations, images) visible.
+    """
+    dst_spTree = dst_slide.shapes._spTree
+
+    # Find the max shape id already in spTree to avoid conflicts
+    max_id = 0
+    for cNvPr in dst_spTree.iter(qn('p:cNvPr')):
+        try:
+            max_id = max(max_id, int(cNvPr.get('id', 0)))
+        except ValueError:
+            pass
+
+    layout_spTree = dst_layout.element.find('.//' + qn('p:cSld')).find(qn('p:spTree'))
+    for sp in layout_spTree.findall(qn('p:sp')):
+        ph_info = _get_placeholder_info(sp)
+        if ph_info is None:
+            continue
+
+        # Create an empty placeholder shape that matches the layout's placeholder
+        max_id += 1
+        ph_type, ph_idx = ph_info
+
+        # Build minimal sp element with placeholder reference
+        nsmap = {'a': 'http://schemas.openxmlformats.org/drawingml/2006/main',
+                 'p': 'http://schemas.openxmlformats.org/presentationml/2006/main',
+                 'r': 'http://schemas.openxmlformats.org/officeDocument/2006/relationships'}
+
+        sp_elem = etree.SubElement(dst_spTree, qn('p:sp'))
+
+        # nvSpPr
+        nvSpPr = etree.SubElement(sp_elem, qn('p:nvSpPr'))
+        cNvPr = etree.SubElement(nvSpPr, qn('p:cNvPr'))
+        cNvPr.set('id', str(max_id))
+        cNvPr.set('name', f'Empty Placeholder {max_id}')
+        cNvSpPr = etree.SubElement(nvSpPr, qn('p:cNvSpPr'))
+        sp_locks = etree.SubElement(cNvSpPr, qn('a:spLocks'))
+        sp_locks.set('noGrp', '1')
+        nvPr = etree.SubElement(nvSpPr, qn('p:nvPr'))
+        ph = etree.SubElement(nvPr, qn('p:ph'))
+        if ph_type:
+            ph.set('type', ph_type)
+        if ph_idx:
+            ph.set('idx', ph_idx)
+
+        # spPr (empty - inherits position/size from layout)
+        etree.SubElement(sp_elem, qn('p:spPr'))
+
+        # txBody with single empty paragraph (overrides layout text)
+        txBody = etree.SubElement(sp_elem, qn('p:txBody'))
+        bodyPr = etree.SubElement(txBody, qn('a:bodyPr'))
+        lstStyle = etree.SubElement(txBody, qn('a:lstStyle'))
+        p = etree.SubElement(txBody, qn('a:p'))
+        endParaRPr = etree.SubElement(p, qn('a:endParaRPr'))
+
+
 def _map_placeholders(src_slide, dst_slide, rid_map):
     """
     Map content from source placeholders into template placeholders.
@@ -369,8 +562,44 @@ def copy_slide(src_prs, src_slide_index, dst_prs, layout_index=0, apply_template
         # Replace entire shape tree with source shapes
         new_spTree = deepcopy(src_slide.shapes._spTree)
         _update_rids_in_tree(new_spTree, rid_map)
+
+        # Classify source placeholders dynamically:
+        # - Auto-generated (sldNum, dt, ftr, hdr): REMOVE - template provides these
+        # - Content with text (title, body, etc.): KEEP as regular shapes
+        # - Content but empty: REMOVE - no point keeping empty boxes
+        _AUTO_PH_TYPES = {'sldNum', 'dt', 'ftr', 'hdr'}
+        for sp in list(new_spTree.findall(qn('p:sp'))):
+            ph_info = _get_placeholder_info(sp)
+            if ph_info is None:
+                continue
+            ph_type = ph_info[0]
+
+            if ph_type in _AUTO_PH_TYPES:
+                # Auto-generated placeholder - template provides its own
+                new_spTree.remove(sp)
+            else:
+                # Content placeholder - check if it has actual text
+                txBody = sp.find(qn('p:txBody'))
+                has_text = False
+                if txBody is not None:
+                    for t_elem in txBody.iter(qn('a:t')):
+                        if t_elem.text and t_elem.text.strip():
+                            has_text = True
+                            break
+                if has_text:
+                    # Has content: bake position and convert to regular shape
+                    _bake_placeholder_styles(sp, src_slide)
+                    _remove_placeholder_ref(sp)
+                else:
+                    # Empty content placeholder: remove to avoid blank boxes
+                    new_spTree.remove(sp)
+
         dst_spTree = dst_slide.shapes._spTree
         dst_spTree.getparent().replace(dst_spTree, new_spTree)
+
+        # Add empty placeholders to override layout's placeholder text
+        # (prevents template text from showing through while keeping decorations)
+        _add_empty_placeholders_from_layout(dst_slide, dst_layout)
 
     # Step 3: Remap fonts to template theme fonts
     if remap_fonts:
@@ -470,14 +699,14 @@ def slide_range(start, end):
 if __name__ == '__main__':
     BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
-    template_path = os.path.join(BASE_DIR, 'template.pptx')
-    upload_path = os.path.join(BASE_DIR, 'file_upload.pptx')
+    template_path = os.path.join(BASE_DIR, '202711_東京_第72回日本生殖医学会学術講演会・総会（パシフィコ横浜_ノース）_231227★.pptx')
+    upload_path = os.path.join(BASE_DIR, '202602_東京_第56回日本心臓血管外科学術総会（幕張）★.pptx')
     output_path = os.path.join(BASE_DIR, 'output.pptx')
 
     # Task: copy first 5 slides + slide 6 + last 2 slides from file_upload
     slide_selections = [
         (upload_path, first_n(upload_path, 6)),   # Slides 0,1,2,3,4,thực tế đã apply được những gì từ file template nhỉ5
-        #(upload_path, [5]),                        # Slide 6 (index 5, 0-based)
+        (upload_path, [23, 24, 25, 27]),                        # Slide 6 (index 5, 0-based)
         #(upload_path, last_n(upload_path, 2)),     # Slides 9,10
     ]
 
