@@ -404,13 +404,9 @@ def _map_placeholders(src_slide, dst_slide, rid_map):
         _update_rids_in_tree(new_sp, rid_map)
         dst_spTree.append(new_sp)
 
-    # Add unmatched source placeholders as regular shapes
-    for type_key, src_sp in src_ph_map.items():
-        if type_key not in matched:
-            new_sp = deepcopy(src_sp)
-            _update_rids_in_tree(new_sp, rid_map)
-            _remove_placeholder_ref(new_sp)
-            dst_spTree.append(new_sp)
+    # Unmatched source placeholders are intentionally dropped.
+    # Template defines the structure — if template doesn't have a matching
+    # placeholder, that content is not part of the template's design.
 
 
 def _extract_theme_colors(prs):
