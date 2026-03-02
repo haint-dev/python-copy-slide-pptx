@@ -27,7 +27,7 @@ def copy_slides_to_template(template_path, slide_selections, output_path):
         template_path: Path to the template PPTX file
         slide_selections: List of tuples (source_path, slide_indices)
             - source_path: Path to a source PPTX file
-            - slide_indices: List of 1-based slide indices to copy
+            - slide_indices: List of 0-based slide indices to copy
         output_path: Path for the output PPTX file
 
     Returns:
@@ -62,11 +62,12 @@ def copy_slides_to_template(template_path, slide_selections, output_path):
             total = src_prs.Slides.Count
 
             for idx in indices:
-                if idx < 1 or idx > total:
-                    print(f"  [SKIP] Slide {idx} out of range (1-{total})")
+                if idx < 0 or idx >= total:
+                    print(f"  [SKIP] Slide {idx} out of range (0-{total-1})")
                     continue
 
-                src_prs.Slides(idx).Copy()
+                # Convert 0-based to 1-based for PowerPoint COM
+                src_prs.Slides(idx + 1).Copy()
                 dst_prs.Slides.Paste()
                 pasted_slide = dst_prs.Slides(dst_prs.Slides.Count)
 
@@ -98,31 +99,31 @@ def copy_slides_to_template(template_path, slide_selections, output_path):
 
 
 # ---------------------------------------------------------------------------
-# Helper functions for building slide index lists (1-based for PowerPoint)
+# Helper functions for building slide index lists (0-based)
 # ---------------------------------------------------------------------------
 
 def first_n(pptx_path, n):
-    """Return 1-based indices of the first N slides."""
+    """Return 0-based indices of the first N slides."""
     app = win32com.client.Dispatch("PowerPoint.Application")
     prs = app.Presentations.Open(os.path.abspath(pptx_path), WithWindow=False)
     total = prs.Slides.Count
     prs.Close()
     app.Quit()
-    return list(range(1, min(n, total) + 1))
+    return list(range(min(n, total)))
 
 
 def last_n(pptx_path, n):
-    """Return 1-based indices of the last N slides."""
+    """Return 0-based indices of the last N slides."""
     app = win32com.client.Dispatch("PowerPoint.Application")
     prs = app.Presentations.Open(os.path.abspath(pptx_path), WithWindow=False)
     total = prs.Slides.Count
     prs.Close()
     app.Quit()
-    return list(range(max(1, total - n + 1), total + 1))
+    return list(range(max(0, total - n), total))
 
 
 def slide_range(start, end):
-    """Return 1-based indices from start to end (inclusive)."""
+    """Return 0-based indices from start to end (inclusive)."""
     return list(range(start, end + 1))
 
 
@@ -137,8 +138,8 @@ if __name__ == '__main__':
     output_path = os.path.join(BASE_DIR, 'output.pptx')
 
     slide_selections = [
-        (upload_path, slide_range(1, 6)),       # Slides 1-6
-        (upload_path, [24, 25, 26, 28]),        # Specific slides
+        (upload_path, first_n(upload_path, 6)),  # Slides 0,1,2,3,4,5
+        (upload_path, [23, 24, 25, 27]),         # Specific slides
     ]
 
     copy_slides_to_template(
