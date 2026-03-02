@@ -67,15 +67,15 @@ def copy_slides_to_template(template_path, slide_selections, output_path):
                     continue
 
                 src_prs.Slides(idx).Copy()
-                # Paste and keep destination theme (ppPasteDefault=2)
                 dst_prs.Slides.Paste()
                 pasted_slide = dst_prs.Slides(dst_prs.Slides.Count)
 
-                # Apply template's first layout to the pasted slide
-                pasted_slide.Layout = dst_prs.Slides(dst_prs.Slides.Count).CustomLayout
-                # Override: use template's slide layout
-                if dst_prs.SlideMaster.CustomLayouts.Count > 0:
-                    pasted_slide.CustomLayout = dst_prs.SlideMaster.CustomLayouts(1)
+                # Apply template's layout to the pasted slide
+                try:
+                    if dst_prs.SlideMaster.CustomLayouts.Count > 0:
+                        pasted_slide.CustomLayout = dst_prs.SlideMaster.CustomLayouts(1)
+                except Exception:
+                    pass  # Keep source layout if assignment fails
 
                 slide_count += 1
                 print(f"  Copied slide {idx} -> destination slide {slide_count}")
