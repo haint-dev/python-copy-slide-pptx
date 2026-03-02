@@ -41,8 +41,16 @@ def copy_slides_to_template(template_path, slide_selections, output_path):
     app.DisplayAlerts = False
 
     try:
-        # Create a new blank presentation
-        dst_prs = app.Presentations.Add()
+        # Open template as destination - theme/layouts are already in place
+        import shutil
+        shutil.copy2(template_path, output_path)
+        dst_prs = app.Presentations.Open(output_path)
+
+        # Remove all existing slides from template
+        while dst_prs.Slides.Count > 0:
+            dst_prs.Slides(1).Delete()
+
+        print(f"Template: {os.path.basename(template_path)} (cleared)")
 
         slide_count = 0
 
@@ -59,19 +67,24 @@ def copy_slides_to_template(template_path, slide_selections, output_path):
                     continue
 
                 src_prs.Slides(idx).Copy()
+                # Paste and keep destination theme (ppPasteDefault=2)
                 dst_prs.Slides.Paste()
+                pasted_slide = dst_prs.Slides(dst_prs.Slides.Count)
+
+                # Apply template's first layout to the pasted slide
+                pasted_slide.Layout = dst_prs.Slides(dst_prs.Slides.Count).CustomLayout
+                # Override: use template's slide layout
+                if dst_prs.SlideMaster.CustomLayouts.Count > 0:
+                    pasted_slide.CustomLayout = dst_prs.SlideMaster.CustomLayouts(1)
+
                 slide_count += 1
                 print(f"  Copied slide {idx} -> destination slide {slide_count}")
 
             src_prs.Close()
 
-        # Apply template design - PowerPoint remaps fonts, colors, backgrounds
-        print(f"\nApplying template: {os.path.basename(template_path)}")
-        dst_prs.ApplyTemplate(template_path)
-
-        # Save as pptx (ppSaveAsOpenXMLPresentation = 24)
-        dst_prs.SaveAs(output_path, 24)
-        print(f"Saved {slide_count} slides to: {output_path}")
+        # Save
+        dst_prs.Save()
+        print(f"\nSaved {slide_count} slides to: {output_path}")
 
         dst_prs.Close()
 
