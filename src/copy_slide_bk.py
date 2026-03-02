@@ -22,13 +22,48 @@ import re
 _media_counter = 0
 
 
-def create_from_template(template_path):
+_A4_WIDTH = 10692000   # 297mm in EMU (landscape)
+_A4_HEIGHT = 7560000   # 210mm in EMU (landscape)
+
+
+def _scale_template_shapes(prs, old_width, old_height):
+    """
+    Scale all shapes in slide layouts and slide masters to match the new
+    slide dimensions.  Called when slide_size is changed so that template
+    decoration shapes (background images, bars, etc.) stretch to fill the
+    new canvas instead of leaving gaps.
+    """
+    new_width = prs.slide_width
+    new_height = prs.slide_height
+    if new_width == old_width and new_height == old_height:
+        return
+
+    sx = new_width / old_width
+    sy = new_height / old_height
+
+    for layout in prs.slide_layouts:
+        cSld = layout.element.find(qn('p:cSld'))
+        if cSld is not None:
+            spTree = cSld.find(qn('p:spTree'))
+            if spTree is not None:
+                _scale_xfrm(spTree, sx, sy)
+
+    for master in prs.slide_masters:
+        cSld = master.element.find(qn('p:cSld'))
+        if cSld is not None:
+            spTree = cSld.find(qn('p:spTree'))
+            if spTree is not None:
+                _scale_xfrm(spTree, sx, sy)
+
+
+def create_from_template(template_path, slide_size=None):
     """
     Create a new empty presentation that inherits all themes/layouts from the template.
     All existing slides are removed.
 
     Args:
         template_path: Path to the template PPTX file
+        slide_size: Optional (width, height) in EMU. Use 'a4' for A4 landscape.
 
     Returns:
         A Presentation object with no slides but all template themes/layouts intact
@@ -41,6 +76,17 @@ def create_from_template(template_path):
         rId = sldId.get(qn('r:id'))
         prs.part.drop_rel(rId)
         sldIdLst.remove(sldId)
+
+    # Override slide dimensions if requested
+    if slide_size is not None:
+        old_width = prs.slide_width
+        old_height = prs.slide_height
+        if slide_size == 'a4':
+            prs.slide_width = _A4_WIDTH
+            prs.slide_height = _A4_HEIGHT
+        else:
+            prs.slide_width, prs.slide_height = slide_size
+        _scale_template_shapes(prs, old_width, old_height)
 
     return prs
 
@@ -303,6 +349,197 @@ def _bake_placeholder_styles(sp_elem, src_slide):
             rPr.set('sz', default_sz)
 
 
+def _get_shape_rect(sp_elem):
+    """Extract bounding rectangle (x, y, cx, cy) from a shape's spPr xfrm."""
+    spPr = sp_elem.find(qn('p:spPr'))
+    if spPr is None:
+        return None
+    xfrm = spPr.find(qn('a:xfrm'))
+    if xfrm is None:
+        return None
+    off = xfrm.find(qn('a:off'))
+    ext = xfrm.find(qn('a:ext'))
+    if off is None or ext is None:
+        return None
+    return (int(off.get('x', 0)), int(off.get('y', 0)),
+            int(ext.get('cx', 0)), int(ext.get('cy', 0)))
+
+
+def _rects_overlap(r1, r2):
+    """Check if two rectangles overlap. Each rect is (x, y, cx, cy)."""
+    return (r1[0] < r2[0] + r2[2] and r1[0] + r1[2] > r2[0] and
+            r1[1] < r2[1] + r2[3] and r1[1] + r1[3] > r2[1])
+
+
+def _find_placeholders_needing_backing(src_slide):
+    """
+    Find placeholders in the source slide that have text content AND
+    inherit a light-colored text fill (bg1, bg2, lt1, lt2) from the layout.
+
+    These placeholders visually depend on a dark decoration shape behind them
+    in the source layout.  Returns a list of bounding rectangles (from the
+    layout placeholder) that need backing decoration shapes.
+    """
+    _LIGHT_SCHEMES = {'bg1', 'bg2', 'lt1', 'lt2'}
+    regions = []
+
+    for sp in src_slide.shapes._spTree.findall(qn('p:sp')):
+        ph_info = _get_placeholder_info(sp)
+        if ph_info is None:
+            continue
+
+        # Must have text content
+        txBody = sp.find(qn('p:txBody'))
+        if txBody is None:
+            continue
+        has_text = any(
+            t.text and t.text.strip()
+            for t in txBody.iter(qn('a:t'))
+        )
+        if not has_text:
+            continue
+
+        # Check if layout gives this placeholder a light text color
+        ph_type, ph_idx = ph_info
+        layout_sp = _find_layout_placeholder(src_slide, ph_type, ph_idx)
+        if layout_sp is None:
+            continue
+
+        default_fill, _ = _collect_defRPr_from_layout(layout_sp)
+        if default_fill is None:
+            continue
+
+        scheme_clr = default_fill.find(qn('a:schemeClr'))
+        if scheme_clr is None or scheme_clr.get('val') not in _LIGHT_SCHEMES:
+            continue
+
+        # Get bounding rect from layout placeholder (slide placeholder often
+        # has empty spPr and inherits position from layout)
+        rect = _get_shape_rect(layout_sp)
+        if rect is not None:
+            regions.append(rect)
+
+    return regions
+
+
+def _scale_xfrm(shape_elem, sx, sy):
+    """
+    Scale position and size of a shape's xfrm by (sx, sy) ratios.
+    Handles both direct spPr/xfrm and nested xfrm in group shapes.
+    """
+    for xfrm in shape_elem.iter(qn('a:xfrm')):
+        off = xfrm.find(qn('a:off'))
+        ext = xfrm.find(qn('a:ext'))
+        if off is not None:
+            off.set('x', str(int(int(off.get('x', 0)) * sx)))
+            off.set('y', str(int(int(off.get('y', 0)) * sy)))
+        if ext is not None:
+            ext.set('cx', str(int(int(ext.get('cx', 0)) * sx)))
+            ext.set('cy', str(int(int(ext.get('cy', 0)) * sy)))
+
+
+def _copy_layout_decorations(src_slide, dst_slide, src_prs, dst_prs):
+    """
+    Copy layout decoration shapes that serve as backgrounds for placeholders
+    with light-colored text.
+
+    Only copies decoration shapes that spatially overlap with placeholders
+    whose inherited text color is a light scheme color (bg1, bg2, lt1, lt2).
+    This ensures dark backing bars are preserved without copying unrelated
+    layout decorations (logos, gradient lines, etc.) that would clash with
+    the destination template.
+
+    Shapes are scaled proportionally when source and destination slide
+    dimensions differ (e.g. 4:3 source → 16:9 template).
+    """
+    backing_regions = _find_placeholders_needing_backing(src_slide)
+    if not backing_regions:
+        return
+
+    src_layout = src_slide.slide_layout
+    layout_spTree = src_layout.element.find('.//' + qn('p:cSld')).find(qn('p:spTree'))
+    dst_spTree = dst_slide.shapes._spTree
+
+    # Compute scale ratios for cross-dimension copying
+    sx = dst_prs.slide_width / src_prs.slide_width
+    sy = dst_prs.slide_height / src_prs.slide_height
+
+    shape_tags = {qn('p:sp'), qn('p:grpSp'), qn('p:pic'),
+                  qn('p:graphicFrame'), qn('p:cxnSp')}
+
+    # Find max shape id already in dst to avoid conflicts
+    max_id = 0
+    for cNvPr in dst_spTree.iter(qn('p:cNvPr')):
+        try:
+            max_id = max(max_id, int(cNvPr.get('id', 0)))
+        except ValueError:
+            pass
+
+    # Build rId map for layout relationships (images referenced by decorations)
+    layout_rid_map = {}
+    for rel in src_layout.part.rels.values():
+        if 'slideMaster' in rel.reltype or rel.is_external:
+            continue
+        if 'image' in rel.reltype:
+            src_part = rel.target_part
+            new_partname = _next_media_partname(src_part.content_type)
+            new_part = Part(
+                new_partname, src_part.content_type,
+                dst_slide.part.package, src_part.blob
+            )
+            new_rid = dst_slide.part.relate_to(new_part, rel.reltype)
+            layout_rid_map[rel.rId] = new_rid
+        elif not rel.is_external:
+            new_rid = dst_slide.part.relate_to(rel.target_part, rel.reltype)
+            layout_rid_map[rel.rId] = new_rid
+
+    # Find insertion point: insert before existing content shapes
+    # so decorations render behind content
+    first_shape_idx = None
+    for i, child in enumerate(dst_spTree):
+        if child.tag in shape_tags:
+            first_shape_idx = i
+            break
+
+    insert_idx = first_shape_idx if first_shape_idx is not None else len(dst_spTree)
+
+    for child in layout_spTree:
+        if child.tag not in shape_tags:
+            continue
+
+        # Skip placeholder shapes — only copy decorations
+        if child.tag == qn('p:sp'):
+            ph_info = _get_placeholder_info(child)
+            if ph_info is not None:
+                continue
+
+        # Only copy if this decoration overlaps with a placeholder that
+        # needs a dark backing shape
+        deco_rect = _get_shape_rect(child)
+        if deco_rect is None:
+            continue
+        if not any(_rects_overlap(deco_rect, region) for region in backing_regions):
+            continue
+
+        new_shape = deepcopy(child)
+
+        # Scale position/size to match destination slide dimensions
+        if sx != 1.0 or sy != 1.0:
+            _scale_xfrm(new_shape, sx, sy)
+
+        # Assign unique shape ids
+        for cNvPr in new_shape.iter(qn('p:cNvPr')):
+            max_id += 1
+            cNvPr.set('id', str(max_id))
+
+        # Update relationship references (e.g. image embeds in p:pic)
+        if layout_rid_map:
+            _update_rids_in_tree(new_shape, layout_rid_map)
+
+        dst_spTree.insert(insert_idx, new_shape)
+        insert_idx += 1
+
+
 def _add_empty_placeholders_from_layout(dst_slide, dst_layout):
     """
     Add empty placeholder shapes to the slide for each placeholder in the layout.
@@ -525,7 +762,7 @@ def _remap_fonts_to_theme(spTree):
 
 def copy_slide(src_prs, src_slide_index, dst_prs, layout_index=0, apply_template_bg=True,
                remap_fonts=True, remap_colors=True, src_theme_colors=None,
-               use_placeholders=False):
+               use_placeholders=False, copy_src_layout_decorations=False):
     """
     Copy a single slide from source presentation to destination.
 
@@ -537,6 +774,10 @@ def copy_slide(src_prs, src_slide_index, dst_prs, layout_index=0, apply_template
         apply_template_bg: If True, use template background; if False, copy source background
         use_placeholders: If True, map source content into template placeholders
             instead of replacing the entire shape tree
+        copy_src_layout_decorations: If True, copy non-placeholder decoration shapes
+            (bars, circles, lines, images) from the source layout into the slide.
+            Useful when the source layout has visual elements (e.g. dark header bars)
+            that give context to the content (e.g. white text on dark background).
 
     Returns:
         The newly created slide in the destination presentation
@@ -590,12 +831,26 @@ def copy_slide(src_prs, src_slide_index, dst_prs, layout_index=0, apply_template
                     # Empty content placeholder: remove to avoid blank boxes
                     new_spTree.remove(sp)
 
+        # Scale all content shapes if source and destination dimensions differ
+        sx = dst_prs.slide_width / src_prs.slide_width
+        sy = dst_prs.slide_height / src_prs.slide_height
+        if sx != 1.0 or sy != 1.0:
+            _scale_xfrm(new_spTree, sx, sy)
+
         dst_spTree = dst_slide.shapes._spTree
         dst_spTree.getparent().replace(dst_spTree, new_spTree)
+
+        # Invalidate the @lazyproperty cache for 'shapes' so subsequent
+        # accesses see the new spTree instead of the stale detached one.
+        dst_slide.__dict__.pop('shapes', None)
 
         # Add empty placeholders to override layout's placeholder text
         # (prevents template text from showing through while keeping decorations)
         _add_empty_placeholders_from_layout(dst_slide, dst_layout)
+
+    # Step 2.5: Copy decoration shapes from source layout (bars, images, etc.)
+    if copy_src_layout_decorations:
+        _copy_layout_decorations(src_slide, dst_slide, src_prs, dst_prs)
 
     # Step 3: Remap fonts to template theme fonts
     if remap_fonts:
@@ -623,7 +878,9 @@ def copy_slide(src_prs, src_slide_index, dst_prs, layout_index=0, apply_template
 def copy_slides_to_template(template_path, slide_selections, output_path,
                             layout_index=0, apply_template_bg=True,
                             remap_fonts=True, remap_colors=True,
-                            use_placeholders=False):
+                            use_placeholders=False,
+                            copy_src_layout_decorations=False,
+                            slide_size=None):
     """
     Main function: create presentation from template and copy selected slides.
 
@@ -635,12 +892,15 @@ def copy_slides_to_template(template_path, slide_selections, output_path,
         output_path: Path for the output PPTX file
         layout_index: Template layout index to apply (0-based)
         apply_template_bg: If True, template background is applied to all slides
+        copy_src_layout_decorations: If True, copy source layout decoration shapes
+        slide_size: Output slide dimensions. Use 'a4' for A4 landscape (297x210mm),
+            or a (width, height) tuple in EMU. None keeps template dimensions.
 
     Returns:
         Path to the saved output file
     """
     print(f"Creating presentation from template: {os.path.basename(template_path)}")
-    dst_prs = create_from_template(template_path)
+    dst_prs = create_from_template(template_path, slide_size=slide_size)
     print(f"  Available layouts: {[l.name for l in dst_prs.slide_layouts]}")
     print(f"  Using layout [{layout_index}]: \"{dst_prs.slide_layouts[layout_index].name}\"")
     print()
@@ -658,7 +918,8 @@ def copy_slides_to_template(template_path, slide_selections, output_path,
                 continue
 
             copy_slide(src_prs, idx, dst_prs, layout_index, apply_template_bg,
-                       remap_fonts, remap_colors, src_theme_colors, use_placeholders)
+                       remap_fonts, remap_colors, src_theme_colors,
+                       use_placeholders, copy_src_layout_decorations)
             slide_count += 1
             print(f"  Copied slide {idx} -> destination slide {slide_count}")
 
@@ -694,10 +955,9 @@ def slide_range(start, end):
 
 if __name__ == '__main__':
     BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-    # template file 202711_東京_第72回日本生殖医学会学術講演会・総会（パシフィコ横浜_ノース）_231227★.pptx
-    # upload file 202602_東京_第56回日本心臓血管外科学術総会（幕張）★.pptx
-    template_path = os.path.join(BASE_DIR, 'template.pptx')
-    upload_path = os.path.join(BASE_DIR, 'uploaded.pptx')
+
+    template_path = os.path.join(BASE_DIR, '202711_東京_第72回日本生殖医学会学術講演会・総会（パシフィコ横浜_ノース）_231227★.pptx')
+    upload_path = os.path.join(BASE_DIR, '202602_東京_第56回日本心臓血管外科学術総会（幕張）★.pptx')
     output_path = os.path.join(BASE_DIR, 'output.pptx')
 
     # Task: copy first 5 slides + slide 6 + last 2 slides from file_upload
@@ -713,4 +973,6 @@ if __name__ == '__main__':
         output_path=output_path,
         layout_index=0,           # "Cover slide layout"
         apply_template_bg=True,   # Apply template background
+        copy_src_layout_decorations=True,  # Copy source layout decorations (bars, images)
+        slide_size='a4',          # Output slides in A4 landscape (297x210mm)
     )
