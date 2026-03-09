@@ -22,6 +22,15 @@ import re
 _media_counter = 0
 
 
+def _get_all_layouts(prs):
+    """Return a flat list of all slide layouts across all slide masters."""
+    layouts = []
+    for master in prs.slide_masters:
+        for layout in master.slide_layouts:
+            layouts.append(layout)
+    return layouts
+
+
 def create_from_template(template_path):
     """
     Create a new empty presentation that inherits all themes/layouts from the template.
@@ -275,6 +284,16 @@ def _bake_placeholder_styles(sp_elem, src_slide):
 
     # --- Bake default text styles (color, font size) from layout into runs ---
     default_fill, default_sz = _collect_defRPr_from_layout(layout_sp)
+
+    # Remap light scheme colors to dark: when text inherits a light color
+    # (bg1, bg2, lt1, lt2) from the source layout, it was designed for dark
+    # backgrounds. Since template has its own design, use dark text instead.
+    _LIGHT_SCHEME_COLORS = {'bg1', 'bg2', 'lt1', 'lt2'}
+    if default_fill is not None:
+        scheme_clr = default_fill.find(qn('a:schemeClr'))
+        if scheme_clr is not None and scheme_clr.get('val') in _LIGHT_SCHEME_COLORS:
+            default_fill = etree.Element(qn('a:solidFill'))
+            etree.SubElement(default_fill, qn('a:schemeClr'), {'val': 'tx1'})
 
     # Fallback: if no explicit fill found from layout, use schemeClr tx1
     # (standard dark text color). This is critical for Keynote which
@@ -543,8 +562,9 @@ def copy_slide(src_prs, src_slide_index, dst_prs, layout_index=0, apply_template
     """
     src_slide = list(src_prs.slides)[src_slide_index]
 
-    # Create new slide with template layout
-    dst_layout = dst_prs.slide_layouts[layout_index]
+    # Create new slide with template layout (supports cross-master index)
+    all_layouts = _get_all_layouts(dst_prs)
+    dst_layout = all_layouts[layout_index]
     dst_slide = dst_prs.slides.add_slide(dst_layout)
 
     # Step 1: Copy relationships (images, charts, etc.) and build rId mapping
@@ -641,8 +661,12 @@ def copy_slides_to_template(template_path, slide_selections, output_path,
     """
     print(f"Creating presentation from template: {os.path.basename(template_path)}")
     dst_prs = create_from_template(template_path)
-    print(f"  Available layouts: {[l.name for l in dst_prs.slide_layouts]}")
-    print(f"  Using layout [{layout_index}]: \"{dst_prs.slide_layouts[layout_index].name}\"")
+    all_layouts = _get_all_layouts(dst_prs)
+    print(f"  Available layouts ({len(all_layouts)} total across all masters):")
+    for i, layout in enumerate(all_layouts):
+        marker = " <--" if i == layout_index else ""
+        print(f"    [{i}] {layout.name}{marker}")
+    print(f"  Using layout [{layout_index}]: \"{all_layouts[layout_index].name}\"")
     print()
 
     slide_count = 0
@@ -671,6 +695,12 @@ def copy_slides_to_template(template_path, slide_selections, output_path,
 # Helper functions for building slide index lists
 # ---------------------------------------------------------------------------
 
+def all_slides(pptx_path):
+    """Return indices of all slides in the presentation."""
+    total = len(list(Presentation(pptx_path).slides))
+    return list(range(total))
+
+
 def first_n(pptx_path, n):
     """Return indices of the first N slides."""
     total = len(list(Presentation(pptx_path).slides))
@@ -696,21 +726,22 @@ if __name__ == '__main__':
     BASE_DIR = os.path.dirname(os.path.abspath(__file__))
     # template file 202711_東京_第72回日本生殖医学会学術講演会・総会（パシフィコ横浜_ノース）_231227★.pptx
     # upload file 202602_東京_第56回日本心臓血管外科学術総会（幕張）★.pptx
-    template_path = os.path.join(BASE_DIR, 'template.pptx')
-    upload_path = os.path.join(BASE_DIR, 'uploaded.pptx')
-    output_path = os.path.join(BASE_DIR, 'output.pptx')
+    template_path = os.path.join(BASE_DIR, 'sample4/template-202605_大阪__第46回日本脳神経外科コングレス総会(国立京都国際会館)★.pptx')
+    upload_path = os.path.join(BASE_DIR, 'sample4/input-202604_東京_第70・71回日本リウマチ学会総会学術集会（福岡コンベンションセンター／パシフィコ横浜)★.pptx')
+    output_path = os.path.join(BASE_DIR, 'sample4/output.pptx')
 
     # Task: copy first 5 slides + slide 6 + last 2 slides from file_upload
     slide_selections = [
-        (upload_path, first_n(upload_path, 6)),   # Slides 0,1,2,3,4,thực tế đã apply được những gì từ file template nhỉ5
-        (upload_path, [23, 24, 25, 27]),                        # Slide 6 (index 5, 0-based)
+        #(upload_path, first_n(upload_path, 6)),   # Slides 0,1,2,3,4,thực tế đã apply được những gì từ file template nhỉ5
+        #pload_path, [23, 24, 25, 27]),                        # Slide 6 (index 5, 0-based)
         #(upload_path, last_n(upload_path, 2)),     # Slides 9,10
+        (upload_path, all_slides(upload_path)),
     ]
 
     copy_slides_to_template(
         template_path=template_path,
         slide_selections=slide_selections,
         output_path=output_path,
-        layout_index=0,           # "Cover slide layout"
+        layout_index=3,           # "Cover slide layout"
         apply_template_bg=True,   # Apply template background
     )
